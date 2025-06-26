@@ -2,6 +2,7 @@ package main
 
 import (
 	"BHCEupload/internal"
+	"bytes"
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/base64"
@@ -13,7 +14,6 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
-	"strings"
 	"time"
 )
 
@@ -32,7 +32,7 @@ type BHResponse struct {
 	Data BHResponseData `json:"data"`
 }
 
-func QueryBloodhoundAPI(uri string, method string, body_file_name string, creds internal.Credentials) (BHResponse, error) {
+func QueryBloodhoundAPI(uri string, method string, body []byte, creds internal.Credentials) (BHResponse, error) {
 	// The first HMAC digest is the token key
 	digester := hmac.New(sha256.New, []byte(creds.BHTokenKey))
 
@@ -51,32 +51,14 @@ func QueryBloodhoundAPI(uri string, method string, body_file_name string, creds 
 	// the signature to prevent replay attacks that seek to modify the payload of a signed request. In the case
 	// where there is no body content the HMAC digest is computed anyway, simply with no values written to the
 	// digester.
-	var body_reader io.Reader = nil
-
-	if body_file_name != "" {
-		// If body_file_name is not empty, we need to read the file and update the digester
-		// after that we seek back to the beginning of the file to be able to pass it to the request
-		var err error
-		body_reader_file, err := os.Open(body_file_name)
-		if err != nil {
-			return BHResponse{}, err
-		}
-		defer body_reader_file.Close()
-		_, err = io.Copy(digester, body_reader_file)
-		if err != nil {
-			return BHResponse{}, err
-		}
-		_, err = body_reader_file.Seek(0, io.SeekStart)
-		if err != nil {
-			return BHResponse{}, err
-		}
-		body_reader = body_reader_file
+	if body != nil {
+		digester.Write(body)
 	}
 
 	bhendpoint := fmt.Sprintf("%s%s", creds.BHUrl, uri)
 
 	// Perform the request with the signed and expected headers
-	req, err := http.NewRequest(method, bhendpoint, body_reader)
+	req, err := http.NewRequest(method, bhendpoint, bytes.NewBuffer(body))
 	if err != nil {
 		return BHResponse{}, err
 	}
@@ -85,11 +67,7 @@ func QueryBloodhoundAPI(uri string, method string, body_file_name string, creds 
 	req.Header.Set("Authorization", fmt.Sprintf("bhesignature %s", creds.BHTokenID))
 	req.Header.Set("RequestDate", datetimeFormatted)
 	req.Header.Set("Signature", base64.StdEncoding.EncodeToString(digester.Sum(nil)))
-	if strings.HasSuffix(body_file_name, ".zip") {
-		req.Header.Set("Content-Type", "application/zip-compressed")
-	} else {
-		req.Header.Set("Content-Type", "application/json")
-	}
+	req.Header.Set("Content-Type", "application/json")
 
 	client := &http.Client{}
 	resp, err := client.Do(req)
@@ -118,18 +96,18 @@ func QueryBloodhoundAPI(uri string, method string, body_file_name string, creds 
 	return response, nil
 }
 
-func UploadData(data_file_name string, creds internal.Credentials) error {
-	upload_job, err := QueryBloodhoundAPI("/api/v2/file-upload/start", "POST", "", creds)
+func UploadData(data []byte, creds internal.Credentials) error {
+	upload_job, err := QueryBloodhoundAPI("/api/v2/file-upload/start", "POST", nil, creds)
 	if err != nil {
 		return err
 	}
 	job_id := upload_job.Data.Id
 	log.Println("Processing job ID:", job_id)
-	_, err = QueryBloodhoundAPI(fmt.Sprintf("/api/v2/file-upload/%d", job_id), "POST", data_file_name, creds)
+	_, err = QueryBloodhoundAPI(fmt.Sprintf("/api/v2/file-upload/%d", job_id), "POST", data, creds)
 	if err != nil {
 		return err
 	}
-	_, err = QueryBloodhoundAPI(fmt.Sprintf("/api/v2/file-upload/%d/end", job_id), "POST", "", creds)
+	_, err = QueryBloodhoundAPI(fmt.Sprintf("/api/v2/file-upload/%d/end", job_id), "POST", nil, creds)
 	if err != nil {
 		return err
 	}
@@ -138,7 +116,11 @@ func UploadData(data_file_name string, creds internal.Credentials) error {
 }
 
 func processFile(path string, creds internal.Credentials) error {
-	err := UploadData(path, creds)
+	jsonFile, err := os.ReadFile(path)
+	if err != nil {
+		return err
+	}
+	err = UploadData(jsonFile, creds)
 	if err != nil {
 		return err
 	}
@@ -172,11 +154,11 @@ func main() {
 			return err
 		}
 
-		if !info.IsDir() && (filepath.Ext(path) == ".json" || filepath.Ext(path) == ".zip") {
+		if !info.IsDir() && filepath.Ext(path) == ".json" {
 			sizeMB := float64(info.Size()) / 1024.0 / 1024.0
 			log.Printf("Uploading file %s, size: %.2f MB", path, sizeMB)
-			if sizeMB > 20_000 {
-				log.Printf("File %s is quite large, will most likely fail, use chophound to make it smaller or compress it using zip, skipping.", path)
+			if sizeMB > 20000 {
+				log.Printf("File %s is quite large, will most likely fail, use chophound to make it smaller, skipping.", path)
 				return nil
 			} else {
 				err := processFile(path, creds)
